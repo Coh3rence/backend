@@ -205,7 +205,7 @@ export class OrganizationService {
 
         const agreementUser = await this.userRepository.findOne({
             where: { id: agreementData.userId },
-            relations: ['organization']
+            relations: ['organization', 'agreement']
         });
         if (!agreementUser ||
             agreementUser.organization.id !== org.id) {
