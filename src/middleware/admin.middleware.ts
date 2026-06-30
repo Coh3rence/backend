@@ -11,6 +11,19 @@ export const adminMiddleware = async (req: Request, res: Response, next: NextFun
 
     const walletAddress = (req as any).user.walletAddress;
 
+    // Bot service account is pre-trusted as admin: it authenticated via the
+    // shared SERVICE_API_KEY and impersonates a designated existing org admin
+    // (set in serviceKeyAuth). Skip the on-chain admin lookup for it.
+    if ((req as any).isServiceAccount) {
+      return next();
+    }
+
+    // Dev-only bypass for the on-chain admin gate so the bot bridge can be
+    // tested without a deployed TeamPoints contract. Never active in production.
+    if (process.env.ADMIN_CHECK_BYPASS === 'true' && process.env.NODE_ENV !== 'production') {
+      return next();
+    }
+
     // Use the team points service to check admin status
     const teamPointsService = container.get(TeamPointsService);
     const isAdmin = await teamPointsService.isAdmin(walletAddress);

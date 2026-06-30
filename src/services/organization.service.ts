@@ -176,6 +176,7 @@ export class OrganizationService {
                 id: u.id,
                 walletAddress: u.address,
                 username: u.username,
+                telegramHandle: u.telegramHandle,
                 profilePicture: u.profilePicture,
                 agreement: u.agreement && {
                     id: u.agreement.id,
