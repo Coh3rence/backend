@@ -82,7 +82,7 @@ export class OrganizationService {
             token,
             organization: user?.organization!,
             invitedBy: user!,
-            usageLimit: 10
+            usageLimit: 1
         });
         await this.invitationRepository.save(invitation);
 
@@ -177,6 +177,7 @@ export class OrganizationService {
                 walletAddress: u.address,
                 username: u.username,
                 telegramHandle: u.telegramHandle,
+                invitationToken: u.invitationToken,
                 profilePicture: u.profilePicture,
                 agreement: u.agreement && {
                     id: u.agreement.id,

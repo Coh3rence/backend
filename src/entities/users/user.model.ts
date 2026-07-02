@@ -16,6 +16,9 @@ export class User {
     @Column({ type: 'varchar', length: 255, nullable: true })
     telegramHandle?: string;
 
+    @Column({ type: 'varchar', length: 255, nullable: true })
+    invitationToken?: string;
+
     @Column({ type: 'varchar', length: 255 })
     username!: string;
 

@@ -93,6 +93,7 @@ export class UserService {
         user.username = userData.username;
         user.email = userData.email;
         user.telegramHandle = userData.telegramHandle;
+        user.invitationToken = userData.invitationToken;
         user.profilePicture = userData.profilePicture;
 
         if (organization) {
