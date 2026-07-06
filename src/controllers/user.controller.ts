@@ -67,7 +67,11 @@ export class UserController {
              const file = (req as any).file;
              let avatar: string | undefined;
 
-             if (file) {
+             // Skip the S3 upload when AWS isn't configured (e.g. local/self-hosted
+             // dev): a missing avatar must not 500 the whole registration.
+             const s3Configured = !!(process.env.AWS_REGION && process.env.S3_BUCKET_NAME);
+
+             if (file && s3Configured) {
                  const uploadResult = await uploadFileToS3({
                      Bucket: process.env.S3_BUCKET_NAME!, // Ensure your bucket name is in env variables
                      Key: `profile-pics/${file.originalname}`, // Customize the path and filename as needed
