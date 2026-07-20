@@ -51,6 +51,14 @@ export class UserService {
             return ResponseModel.createError(new Error('User already registered'), 400);
         }
 
+        // Validate email uniqueness BEFORE consuming the invitation token: token
+        // consumption (usageCount++/isActive) is irreversible and single-use, so a
+        // duplicate-email failure after consumption would burn the token for good.
+        const userByEmail = await this.userRepository.findOne({ where: { email: userData.email } });
+        if (userByEmail) {
+            return ResponseModel.createError(new Error('Email already registered'), 400);
+        }
+
         if (userData.invitationToken) {
             // Find the invitation using the token
             const invitation = await this.invitationRepository.findOne({
@@ -81,11 +89,6 @@ export class UserService {
             await this.invitationRepository.save(invitation);
 
             organization = invitation.organization;
-        }
-
-        const userByEmail = await this.userRepository.findOne({ where: { email: userData.email } });
-        if (userByEmail) {
-            return ResponseModel.createError(new Error('Email already registered'), 400);
         }
 
         const user = new User();
