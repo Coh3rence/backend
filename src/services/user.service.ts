@@ -20,6 +20,31 @@ import {
 
 dotenv.config();  // Load the environment variables from .env
 
+/**
+ * Internal control-flow error for registerUser: a validation failure raised
+ * inside the registration transaction so it rolls back the (possibly already
+ * consumed) invite token, while carrying the HTTP status to surface to the caller.
+ * A tagged Error (not a subclass) to keep this file to a single class (tslint
+ * max-classes-per-file).
+ */
+type RegisterError = Error & { status: number };
+
+function registerError(message: string, status: number): RegisterError {
+    return Object.assign(new Error(message), { status, name: 'RegisterError' });
+}
+
+function isRegisterError(err: unknown): err is RegisterError {
+    return err instanceof Error && err.name === 'RegisterError'
+        && typeof (err as { status?: unknown }).status === 'number';
+}
+
+/** MySQL duplicate-entry (unique-constraint) violation, as wrapped by TypeORM. */
+function isDuplicateEntryError(err: unknown): boolean {
+    const driver = (err as { driverError?: { code?: string; errno?: number } })?.driverError;
+    const e = (driver ?? err) as { code?: string; errno?: number } | null;
+    return e?.code === 'ER_DUP_ENTRY' || e?.errno === 1062;
+}
+
 
 @injectable()
 export class UserService {
@@ -43,71 +68,105 @@ export class UserService {
         userData: CreateUserModel
     ): Promise<ResponseModel<CreatedResponseModel | null>> {
 
-        let organization: Organization | null = null;
-
+        // Fast, friendly pre-checks so the common duplicate case returns a clean 400
+        // before we touch the token. These findOnes are NOT the real guard, though: a
+        // concurrent signup can slip between the check and the insert, so the DB unique
+        // constraints on address+email (user.model.ts) are the source of truth and are
+        // caught as a duplicate-entry violation inside the transaction below.
         const existingUser = await this.userRepository
             .findOne({ where: { address: userData.walletAddress?.toLowerCase() } });
         if (existingUser) {
             return ResponseModel.createError(new Error('User already registered'), 400);
         }
 
-        // Validate email uniqueness BEFORE consuming the invitation token: token
-        // consumption (usageCount++/isActive) is irreversible and single-use, so a
-        // duplicate-email failure after consumption would burn the token for good.
         const userByEmail = await this.userRepository.findOne({ where: { email: userData.email } });
         if (userByEmail) {
             return ResponseModel.createError(new Error('Email already registered'), 400);
         }
 
-        if (userData.invitationToken) {
-            // Find the invitation using the token
-            const invitation = await this.invitationRepository.findOne({
-                where: { token: userData.invitationToken, isActive: true },
-                relations: ['organization']
+        try {
+            // Consume the invite and create the user in ONE transaction: if the user
+            // insert fails (e.g. a racing signup trips the unique address/email
+            // constraint), the whole thing rolls back and the single-use token is NOT
+            // burned — the contributor can retry with the same link.
+            const createdUserId = await AppDataSource.transaction(async (manager) => {
+                let organization: Organization | null = null;
+
+                if (userData.invitationToken) {
+                    // Existence lookup is for messaging only (distinguish "unknown token"
+                    // from "already used up"); the atomic UPDATE below is authoritative.
+                    const invitation = await manager.getRepository(Invitation).findOne({
+                        where: { token: userData.invitationToken },
+                        relations: ['organization']
+                    });
+                    if (!invitation) {
+                        throw registerError('Invalid or expired invitation token.', 400);
+                    }
+
+                    // Atomic single-use consume: increment only while the row is still
+                    // active and under its limit, flipping isActive off on the final use.
+                    // Because the guard and the increment happen in one UPDATE, two
+                    // concurrent redemptions of a usageLimit:1 token can't both win —
+                    // exactly one of them affects a row.
+                    const consumed = await manager.getRepository(Invitation)
+                        .createQueryBuilder()
+                        .update(Invitation)
+                        // NB: MySQL evaluates SET assignments left-to-right and later
+                        // expressions see the already-updated column, so by the time the
+                        // isActive CASE runs, usageCount is ALREADY incremented — the guard
+                        // is `usageCount >= usageLimit` (not `+ 1`), else a multi-use token
+                        // would deactivate one redemption early and lock out the last user.
+                        .set({
+                            usageCount: () => 'usageCount + 1',
+                            isActive: () => 'CASE WHEN usageCount >= usageLimit THEN false ELSE isActive END'
+                        })
+                        .where('token = :token AND isActive = true AND usageCount < usageLimit', {
+                            token: userData.invitationToken
+                        })
+                        .execute();
+
+                    if (consumed.affected !== 1) {
+                        throw registerError(
+                            'This invitation link has already been used by the maximum number of users.',
+                            400
+                        );
+                    }
+
+                    organization = invitation.organization;
+                }
+
+                const user = new User();
+                user.address = userData.walletAddress!.toLowerCase();
+                user.username = userData.username;
+                user.email = userData.email;
+                user.telegramHandle = userData.telegramHandle;
+                user.invitationToken = userData.invitationToken;
+                user.profilePicture = userData.profilePicture;
+                if (organization) {
+                    user.organization = organization;
+                }
+
+                const saved = await manager.getRepository(User).save(user);
+                return saved.id;
             });
 
-            if (!invitation) {
-                return ResponseModel.createError(new Error('Invalid or expired invitation token.'), 400);
+            // Side effects only after the transaction commits, so a failed email
+            // never rolls back a valid registration (and vice versa).
+            this.emailService.sendCongratsOnRegistration(userData.email, userData.username);
+
+            return ResponseModel.createSuccess({ id: createdUserId });
+        } catch (err) {
+            if (isRegisterError(err)) {
+                return ResponseModel.createError(new Error(err.message), err.status);
             }
-
-            // Check if the usage count has reached the usage limit
-            if (invitation.usageCount >= invitation.usageLimit) {
-                return ResponseModel.createError(
-                    new Error('This invitation link has already been used by the maximum number of users.'),
-                    400
-                );
+            // A racing signup slipped past the pre-checks and hit the unique
+            // address/email constraint — surface a clean 400 instead of an uncaught
+            // 500. The token consume was rolled back with the transaction.
+            if (isDuplicateEntryError(err)) {
+                return ResponseModel.createError(new Error('User already registered'), 400);
             }
-
-            // Increment the usage count
-            invitation.usageCount += 1;
-
-            // Mark the invitation as inactive if the usage limit is reached
-            if (invitation.usageCount >= invitation.usageLimit) {
-                invitation.isActive = false;
-            }
-
-            await this.invitationRepository.save(invitation);
-
-            organization = invitation.organization;
+            throw err;
         }
-
-        const user = new User();
-        user.address = userData.walletAddress!.toLowerCase();
-        user.username = userData.username;
-        user.email = userData.email;
-        user.telegramHandle = userData.telegramHandle;
-        user.invitationToken = userData.invitationToken;
-        user.profilePicture = userData.profilePicture;
-
-        if (organization) {
-            user.organization = organization;
-        }
-
-        await this.userRepository.save(user);
-
-        this.emailService.sendCongratsOnRegistration(user.email, user.username);
-
-        return ResponseModel.createSuccess({ id: user.id });
     }
 
     public async getByWalletAddress(walletAddress: string): Promise<ResponseModel<UserResponseModel | null>> {
